@@ -1,0 +1,64 @@
+# This playbook updates the APT package index, previews and applies package upgrades,
+# handles reboots if required, and performs cleanup on all target hosts.
+
+- name: Perform APT update, upgrade, and cleanup
+  hosts: all
+  become: true
+  serial: 1                   # Run the playbook on one host at a time
+  max_fail_percentage: 20     # Allow up to 20% of hosts to fail before stopping the play
+
+  tasks:
+    - name: Update APT package index
+    # This ensures the package index is up-to-date before performing any upgrades. 
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600     # Refresh the cache if it's older than 1 hour
+
+    - name: Preview packages to be upgraded
+    # Retrieves a list of all packages that have available upgrades.
+    # Output is registered for reporting in the next step.    
+      shell: apt list --upgradable 2>/dev/null | tail -n +2
+      register: upgradable_packages
+      changed_when: false
+
+    - name: Show upgradable packages
+    # Displays the list of upgradable packages if there are any.    
+      debug:
+        msg: "{{ upgradable_packages.stdout_lines }}"
+      when: upgradable_packages.stdout_lines | length > 0
+
+    - name: Upgrade all packages to latest version
+    # Performs a full distribution upgrade (equivalent to 'apt-get dist-upgrade').    
+      apt:
+        upgrade: dist
+
+    - name: Check if a reboot is required
+    # Checks if the system requires a reboot after the upgrade.
+      stat:
+        path: /var/run/reboot-required
+        get_checksum: no
+      register: reboot_required_file
+
+    - name: Reboot the server (if required)
+    # Reboots the server if a reboot is required. Waits up to 10 minutes for the system to come back.
+      reboot:
+        reboot_timeout: 600
+        test_command: whoami
+      when: reboot_required_file.stat.exists
+
+    - name: Wait before next host starts (only if reboot occurred)
+    # Waits 10 minutes after reboot to allow the system to fully recover before proceeding to the next host.    
+      pause:
+        seconds: 600
+      when: reboot_required_file.stat.exists
+
+    - name: Remove dependencies that are no longer required
+    # Removes unused packages that were automatically installed to satisfy dependencies.  
+      apt:
+        autoremove: yes
+
+    - name: Autoclean package cache
+    # Cleans up the local repository of retrieved package files that are no longer needed.
+      apt:
+        autoclean: yes
+      
