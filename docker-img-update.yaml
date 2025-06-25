@@ -1,0 +1,63 @@
+---
+# This playbook checks for Docker project paths on the host, selects the appropriate one,
+# brings up containers using Docker Compose, and prunes unused Docker resources.
+
+- hosts: all
+  become: true
+
+  vars:
+    docker_paths:
+    # Define possible Docker Compose project locations.
+      root_docker:
+        dest: /docker/docker-compose.yaml
+        project_src: /docker/
+      storage_docker:
+        dest: /storage/docker/docker-compose.yaml
+        project_src: /storage/docker/
+
+  tasks:
+  # Check if the /docker directory exists on the host.
+    - name: Check if /docker exists
+      stat:
+        path: /docker
+      register: docker_path
+
+    - name: Check if /storage/docker exists
+    # Check if the /storage/docker directory exists on the host.
+      stat:
+        path: /storage/docker
+      register: storage_docker_path
+
+    - name: Set active Docker path
+    # Set the active Docker project path based on which directory exists.
+    # Preference is given to /docker, then to /storage/docker.
+      set_fact:
+        active_docker: >-
+          {{ docker_paths.root_docker if docker_path.stat.exists else
+             (docker_paths.storage_docker if storage_docker_path.stat.exists else {}) }}
+
+    - name: Fail if no Docker path found
+    # Stop execution with an error if neither Docker project path exists. 
+      fail:
+        msg: "Neither /docker nor /storage/docker exists on this host."
+      when: active_docker == {}
+
+    - name: Pull & bring up new images
+    # Use Docker Compose V2 to pull latest images and bring up containers.
+    # Removes containers that are no longer referenced in the compose file.    
+      community.docker.docker_compose_v2:
+        project_src: "{{ active_docker.project_src }}"
+        pull: always
+        state: present
+        remove_orphans: true
+      tags: ['update']
+
+    - name: Prune leftover Docker references
+    # Prune all unused Docker objects to free up space.    
+      community.docker.docker_prune:
+        containers: true
+        images: true
+        networks: true
+        volumes: true
+        builder_cache: true
+      tags: ['prune']
