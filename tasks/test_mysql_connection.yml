@@ -1,0 +1,63 @@
+---
+# tasks/test_mysql_connection.yml
+# Reusable task file to test MySQL connection before proceeding
+# Include this at the start of playbooks that use MySQL logging
+
+- name: MySQL connection test block
+  block:
+    - name: Test MySQL connection
+      community.mysql.mysql_query:
+        login_host: "{{ mysql_host }}"
+        login_port: "{{ mysql_port }}"
+        login_db: "{{ mysql_database }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        query: SELECT 1 as connection_test
+      register: mysql_connection_test
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: MySQL connection successful
+      debug:
+        msg: "MySQL connection successful ({{ mysql_host }}:{{ mysql_port }}/{{ mysql_database }})"
+      delegate_to: localhost
+      become: false
+
+  rescue:
+    - name: Send MySQL failure notification to Gotify
+      uri:
+        url: "{{ gotify_url }}/message?token={{ gotify_token }}"
+        method: POST
+        body_format: json
+        body:
+          title: "MySQL Connection Failed"
+          message: |
+            Playbook: {{ ansible_play_name | default('Unknown') }}
+            Host: {{ inventory_hostname }}
+            
+            MySQL Connection Details:
+            - Server: {{ mysql_host }}:{{ mysql_port }}
+            - Database: {{ mysql_database }}
+            - User: {{ mysql_user }}
+            
+            Error: {{ ansible_failed_result.msg | default(mysql_connection_test.msg) | default('Connection failed') }}
+            
+            Playbook execution stopped.
+          priority: 10
+      delegate_to: localhost
+      become: false
+      when: 
+        - gotify_token is defined
+        - gotify_token != ""
+      ignore_errors: yes
+
+    - name: Fail playbook execution
+      fail:
+        msg: |
+          MySQL connection failed - cannot proceed with playbook!
+          
+          Server: {{ mysql_host }}:{{ mysql_port }}
+          Database: {{ mysql_database }}
+          User: {{ mysql_user }}
+          Error: {{ ansible_failed_result.msg | default(mysql_connection_test.msg) | default('Connection failed') }}
