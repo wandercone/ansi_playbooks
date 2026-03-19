@@ -1,63 +1,281 @@
 ---
 # This playbook checks for Docker project paths on the host, selects the appropriate one,
-# brings up containers using Docker Compose, and prunes unused Docker resources.
+# brings up containers using Docker Compose, prunes unused Docker resources, and logs to MySQL.
+# Only critical failures are sent to Gotify.
+# credits to smdion for some of the logic
 
 - hosts: all
   become: true
-
   vars:
-    docker_paths:
-    # Define possible Docker Compose project locations.
-      root_docker:
-        dest: /docker/docker-compose.yaml
-        project_src: /docker/
-      storage_docker:
-        dest: /storage/docker/docker-compose.yaml
-        project_src: /storage/docker/
-
+    gotify_url: "https://gotify.domain.com"
+    
   tasks:
-  # Check if the /docker directory exists on the host.
-    - name: Check if /docker exists
-      stat:
-        path: /docker
-      register: docker_path
-
-    - name: Check if /storage/docker exists
-    # Check if the /storage/docker directory exists on the host.
-      stat:
-        path: /storage/docker
-      register: storage_docker_path
-
-    - name: Set active Docker path
-    # Set the active Docker project path based on which directory exists.
-    # Preference is given to /docker, then to /storage/docker.
-      set_fact:
-        active_docker: >-
-          {{ docker_paths.root_docker if docker_path.stat.exists else
-             (docker_paths.storage_docker if storage_docker_path.stat.exists else {}) }}
-
-    - name: Fail if no Docker path found
-    # Stop execution with an error if neither Docker project path exists. 
+    - name: Test MySQL connectivity
+      include_tasks: tasks/test_mysql_connection.yml
+      when: mysql_password is defined
+      tags: ['always']
+    
+    - name: Verify docker_path is set
       fail:
-        msg: "Neither /docker nor /storage/docker exists on this host."
-      when: active_docker == {}
+        msg: "docker_path must be defined for this host in inventory"
+      when: docker_path is not defined or docker_path == ""
+      
+    - name: Check if docker path exists
+      stat:
+        path: "{{ docker_path }}"
+      register: docker_path_stat
+      
+    - name: Fail if docker path doesn't exist
+      fail:
+        msg: "Docker path {{ docker_path }} does not exist on {{ inventory_hostname }}"
+      when: not docker_path_stat.stat.exists
+      
+    - name: Set docker compose file path
+      set_fact:
+        compose_file: "{{ docker_path }}/docker-compose.yaml"
+      
+    - name: Create image info script
+      copy:
+        dest: /tmp/get_image_info.sh
+        mode: '0755'
+        content: |
+          {% raw %}
+          #!/bin/bash
+          set -euo pipefail
+          PROJECT_DIR="$1"
+          COMPOSE_FILE="$2"
+          
+          cd "$PROJECT_DIR"
+          
+          # Get all services and their images
+          while read service; do
+            # Get the image name from config
+            image=$(docker compose -f "$COMPOSE_FILE" config | \
+                    awk -v svc="$service" '
+                      $0 ~ "^  "svc":$" {in_svc=1; next}
+                      in_svc && /^    image:/ {sub(/^    image: /, ""); print; exit}
+                      /^  [a-zA-Z0-9_-]+:$/ {in_svc=0}
+                    ')
+            
+            if [ -n "$image" ] && docker image inspect "$image" &>/dev/null 2>&1; then
+              digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' 2>/dev/null | \
+                      grep -oP 'sha256:[a-f0-9]{64}' | head -1)
+              created=$(docker image inspect "$image" --format '{{.Created}}')
+              
+              echo "${service}|${image}|${digest:-none}|${created}"
+            fi
+          done < <(docker compose -f "$COMPOSE_FILE" config --services)
+          {% endraw %}
 
-    - name: Pull & bring up new images
-    # Use Docker Compose V2 to pull latest images and bring up containers.
-    # Removes containers that are no longer referenced in the compose file.    
-      community.docker.docker_compose_v2:
-        project_src: "{{ active_docker.project_src }}"
-        pull: always
-        state: present
-        remove_orphans: true
-      tags: ['update']
+    - name: Get current image details before update
+      shell: bash /tmp/get_image_info.sh "{{ docker_path }}" "{{ compose_file }}"
+      register: images_before
+      changed_when: false
+      
+    - name: Docker update and logging block
+      block:
+        - name: Pull & bring up new images
+          community.docker.docker_compose_v2:
+            project_src: "{{ docker_path }}"
+            pull: always
+            state: present
+            remove_orphans: true
+          register: compose_result
+          retries: 3
+          delay: 10
+          until: compose_result is succeeded
+          tags: ['update']
+          
+        - name: Get current image details after update
+          shell: bash /tmp/get_image_info.sh "{{ docker_path }}" "{{ compose_file }}"
+          register: images_after
+          changed_when: false
+          
+        - name: Parse image updates
+          set_fact:
+            image_updates: |
+              {% set before_dict = {} %}
+              {% for line in images_before.stdout_lines %}
+              {%   set parts = line.split('|') %}
+              {%   if parts | length == 4 %}
+              {%     set _ = before_dict.update({parts[0]: {'image': parts[1], 'digest': parts[2], 'created': parts[3]}}) %}
+              {%   endif %}
+              {% endfor %}
+              {% set updates = [] %}
+              {% for line in images_after.stdout_lines %}
+              {%   set parts = line.split('|') %}
+              {%   if parts | length == 4 %}
+              {%     set service = parts[0] %}
+              {%     set image = parts[1] %}
+              {%     set digest_new = parts[2] %}
+              {%     set created_new = parts[3] %}
+              {%     if service in before_dict %}
+              {%       set digest_old = before_dict[service].digest %}
+              {%       if digest_old != digest_new %}
+              {%         set _ = updates.append({
+                           'service': service,
+                           'image': image,
+                           'old_digest': digest_old,
+                           'new_digest': digest_new,
+                           'created_date': created_new,
+                           'was_updated': true
+                         }) %}
+              {%       endif %}
+              {%     else %}
+              {%       set _ = updates.append({
+                         'service': service,
+                         'image': image,
+                         'old_digest': 'none',
+                         'new_digest': digest_new,
+                         'created_date': created_new,
+                         'was_updated': true
+                       }) %}
+              {%     endif %}
+              {%   endif %}
+              {% endfor %}
+              {{ updates }}
+          
+        - name: Convert updates to list
+          set_fact:
+            updates_list: "{{ image_updates | from_yaml }}"
+          when: 
+            - image_updates is defined
+            - image_updates | trim != '[]'
+        
+        - name: Normalize datetime formats for MySQL
+          set_fact:
+            updates_list_normalized: "{{ updates_list_normalized | default([]) + [item | combine({'created_date': item.created_date.split('.')[0] | replace('T', ' ') | replace('Z', '')})] }}"
+          loop: "{{ updates_list | default([]) }}"
+          when:
+            - updates_list is defined
+            - updates_list | length > 0
+        
+        - name: Generate UUID v5 (SHA-based)
+          set_fact:
+            run_uuid: "{{ (inventory_hostname + ansible_date_time.iso8601_micro) | to_uuid }}"
+        
+        - name: Log update run to MySQL
+          community.mysql.mysql_query:
+            login_host: "{{ mysql_host }}"
+            login_port: "{{ mysql_port }}"
+            login_db: "{{ mysql_database }}"
+            login_user: "{{ mysql_user }}"
+            login_password: "{{ mysql_password }}"
+            query:
+              - >
+                INSERT INTO docker_update_runs 
+                (run_uuid, hostname, status, updates_count, run_time)
+                VALUES (%s, %s, %s, %s, NOW())
+            positional_args:
+              - "{{ run_uuid }}"
+              - "{{ inventory_hostname }}"
+              - "success"
+              - "{{ updates_list | default([]) | length }}"
+          delegate_to: localhost
+          become: false
+          when: mysql_password is defined
+            
+        - name: Log individual image updates to MySQL
+          community.mysql.mysql_query:
+            login_host: "{{ mysql_host }}"
+            login_port: "{{ mysql_port }}"
+            login_db: "{{ mysql_database }}"
+            login_user: "{{ mysql_user }}"
+            login_password: "{{ mysql_password }}"
+            query:
+              - >
+                INSERT INTO docker_image_updates 
+                (run_uuid, hostname, service_name, image_name, old_digest, new_digest, image_created_date, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            positional_args:
+              - "{{ run_uuid }}"
+              - "{{ inventory_hostname }}"
+              - "{{ item.service }}"
+              - "{{ item.image }}"
+              - "{{ item.old_digest }}"
+              - "{{ item.new_digest }}"
+              - "{{ item.created_date }}"
+          loop: "{{ updates_list_normalized | default([]) }}"
+          delegate_to: localhost
+          become: false
+          when: 
+            - mysql_password is defined
+            - run_uuid is defined
+            - updates_list_normalized is defined
+            - updates_list_normalized | length > 0
 
+      rescue:
+        - name: Generate UUID for failed run
+          set_fact:
+            run_uuid: "{{ (inventory_hostname + ansible_date_time.iso8601_micro) | to_uuid }}"
+            
+        - name: Log failed update run to MySQL
+          community.mysql.mysql_query:
+            login_host: "{{ mysql_host }}"
+            login_port: "{{ mysql_port }}"
+            login_db: "{{ mysql_database }}"
+            login_user: "{{ mysql_user }}"
+            login_password: "{{ mysql_password }}"
+            query:
+              - >
+                INSERT INTO docker_update_runs 
+                (run_uuid, hostname, status, updates_count, run_time)
+                VALUES (%s, %s, %s, %s, NOW())
+            positional_args:
+              - "{{ run_uuid }}"
+              - "{{ inventory_hostname }}"
+              - "failed"
+              - 0
+          delegate_to: localhost
+          become: false
+          when: mysql_password is defined
+          ignore_errors: yes
+          
+        - name: Send failure notification to Gotify
+          uri:
+            url: "{{ gotify_url }}/message?token={{ gotify_token }}"
+            method: POST
+            body_format: json
+            body:
+              title: "Docker Update Failed"
+              message: |
+                Host: {{ inventory_hostname }}
+                Path: {{ docker_path }}
+                Error: {{ ansible_failed_result.msg | default(ansible_failed_task.name) }}
+                
+                Check logs for details.
+              priority: 10
+          delegate_to: localhost
+          become: false
+          when: 
+            - gotify_token is defined 
+            - gotify_token != ""
+          ignore_errors: yes
+          
+        - name: Re-raise the error
+          fail:
+            msg: "Docker update failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+      
     - name: Prune leftover Docker references
-    # Prune all unused Docker objects to free up space.    
       community.docker.docker_prune:
         containers: true
         images: true
         networks: true
         volumes: true
         builder_cache: true
+      register: prune_result
       tags: ['prune']
+      
+    - name: Display prune results
+      debug:
+        msg: |
+          Prune completed on {{ inventory_hostname }}:
+          - Containers deleted: {{ prune_result.containers | default([]) | length }}
+          - Images deleted: {{ prune_result.images | default([]) | length }}
+          - Space reclaimed: {{ (prune_result.space_reclaimed | default(0) / 1024 / 1024 / 1024) | round(2) }} GB
+      when: prune_result is defined
+      
+    - name: Cleanup script
+      file:
+        path: /tmp/get_image_info.sh
+        state: absent
